@@ -1,0 +1,297 @@
+---
+title: "qPCR analysis workflow"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+```{r library, message = FALSE, echo = FALSE}
+#install.packages("tidyverse") #Use this to install if they are not installed yet.
+#install.packages("rlang")     #Use this to install if they are not installed yet.
+#install.packages("ggpubr")    #Use this to install if they are not installed yet. 
+
+library(tidyverse) 
+library(rlang)
+library(ggpubr) #this package extends ggplot2
+```
+
+
+```{r functions, echo = FALSE}
+#to do: function for showing triplicates with outlier, function for summary statistics, use qpcr_ddcq with cq values as input, error messages.
+qpcr_clean <- function(.data, cq, threshold, ...){
+  # to do: add if statements for errors. no column called cq etc. 
+  dots <- names(enquos(..., .named = TRUE))
+  
+  median_cq <- .data %>%
+    group_by(...) %>%
+    summarise(median_cq = median({{cq}}, na.rm = TRUE), #calculate the median cq value
+            count = sum(!is.na({{cq}}))) #count the amount of techreps with a cq value
+  
+  dev_test <- .data %>%
+    full_join(median_cq, by = dots) %>%
+    filter(count > 1) %>% #take out tech reps with only 1 value
+    mutate(distance_med = abs({{cq}} - median_cq)) %>%  #calculate deviation from median
+    mutate(keep = if_else(count == 2,
+                          if_else(distance_med*2 < threshold, TRUE, FALSE),
+                          if_else(distance_med   < threshold, TRUE, FALSE)))
+  
+  count_true <- dev_test %>%
+    group_by(...) %>%
+    summarise(count_keep = sum(keep, na.rm = TRUE))
+  
+  clean_data <- dev_test %>%
+    full_join(count_true, by = dots) %>%
+    filter(count_keep > 1, #remove samples where all are more than the threshold apart
+           keep == TRUE) %>% #remove all other outliers
+    select(-(median_cq:count_keep)) #remove the now unnecessary columns
+  clean_data
+}
+
+qpcr_avg <- function(.data, cq, ...){
+  .data %>%
+    group_by(...) %>%
+    summarise(cq = mean({{cq}}, na.rm = TRUE)) %>%
+    ungroup()
+}
+
+qpcr_dcq <- function(.data, primer_pair, housekeeping, ...){
+  # to do: add if statements to check input. no column called cq etc. 
+  dots <- names(enquos(..., .named = TRUE))
+  
+  cq_hk <- .data %>%
+    filter({{primer_pair}} == housekeeping) %>%
+    rename(cq_hk = cq) %>%
+    select(..., cq_hk)
+  
+  dcq_values <- .data %>%
+    filter({{primer_pair}} != "gene_hk") %>%
+    inner_join(cq_hk, by = dots) %>%
+    mutate(dcq = cq - cq_hk)
+  dcq_values
+}
+
+qpcr_ddcq <- function(.data, treatment, untreated, primer_pair){
+  #to do: check inputs. must be dcq values. 
+  primer_join <- names(enquos(primer_pair, .named = TRUE))
+  
+  dcq_ctrl <- .data %>%
+    filter({{treatment}} == untreated) %>%
+    group_by({{primer_pair}}) %>%
+    summarise(dcq_ctrl = mean(dcq, na.rm = TRUE))
+  
+  ddcq <- .data %>%
+    filter(treatment != untreated) %>%
+    inner_join(dcq_ctrl, by = primer_join) %>%
+    mutate(ddcq = dcq - dcq_ctrl,
+           fold_change = 2^-ddcq)
+  ddcq
+}
+
+```
+
+
+# Preparation
+
+Open rstudio. Make a new project by clicking file > new project > new directory > new project > give it a logical name and location. 
+
+# Preparing data in excel
+
+## Step 1: Check the curves
+
+Look at all the curves at the qPCR machine. Note the wells with weirdly shaped curves. Exclude those from the analyses (but don't modify the raw data files!)
+
+## Step 2: Manual labour
+
+Copy > paste all raw data into an excel file. Do this in a [tidy format](https://r4ds.had.co.nz/tidy-data.html). This means each measurement (Cq value) has its own row, and every experimental variable has it's own column. Also include a column for the genes that were the target of your PCR and for technical replicate number (i.e. 1,2,3). 
+
+## Step 3: Clean up
+
+Delete all Cq values that had weird curves, as noted in step 1.
+
+## Step 4: Save
+
+Save the excel file as a .csv file. Save it inside the folder you just created for this r project. Now you don't have to use setwd()! And if you send your r project to a collaborator, they also don't need to use setwd()!
+
+# Analyses in R
+
+## Importing data
+If you closed rstudio in the meantime, start it and open the project created for this analysis. 
+
+Depending on your computer settings, the column separator can either be either a comma or a semicolon. Furthermore, the decimal point separator may be either a dot or a comma. You can check this by opening the csv file in a program like notepad. Alternatively, just try to load the data and see what happens. Here's when to use which function:
+
+- comma delimited, dot as decimal point > use `read_csv(file = "yourfile.csv")`
+- semicolon delimited, comma as decimal point > use `read_csv2(file = "yourfile.csv")`
+- semicolon delimited, dot as decimal point > use `read_delim(file = "yourfile.csv", delim = ";")`
+
+Note: these function are from the readr package, which is part of the tidyverse. They are faster and more reproducible than their base r equivalent. To learn more go [here](https://r4ds.had.co.nz/data-import.html).
+
+In this example we will use some randomly generated data. It contain Cq values for three genes: gene_a, gene_b and gene_hk (hk = housekeeping). There are also three treatment conditions: a, b and ctrl. ctrl is the untreated control. Three biological replicates were performed. 
+
+```{r loading data}
+raw_data <- read_csv(file = "rawcqvalues.csv") # see above for which function to use if you use your own file. 
+```
+
+It's always a good idea to have a quick look at the imported data. Check if the columns are separated correctly. Check if the decimal point is at the right place.
+
+```{r check import}
+knitr::kable(
+  raw_data[1:5, ], 
+  caption = "First 5 rows of the raw data"
+)
+```
+
+## Cleaning the data
+
+The function `qpcr_clean()` removes outliers from technical qPCR replicates. These outliers can occur thru inaccurate pipetting, pipetting in the wrong well, seal detachment, etc. It does so based on the deviation from the median value, using the following rules: 
+
+* If only one Cq value is present (i.e. the other replicates failed to produce a Cq value), it will be removed. 
+* If only two Cq values are present, they need to be less than the threshold appart. 
+* For three or more technical replicates:
+  * If the absolute distance between a Cq value and the median Cq is greater than a set threshold, than this value will be removed. 
+  * If all Cq values within a technical replicate are more than the threshold appart, they will all be removed. 
+
+Function arguments:
+
+* The first argument is name of the data you want to use. 
+* `cq = ` tells the function the name of the column containing the Cq values. 
+* `threshold = ` sets the maximum deviation from the median value. 
+* Finally, the function needs the names of all other columns that are not the cq_values or denote technical replicates. These will be used to make groups, so calculations will be made for each unique combination of treatment, primer_pair and bio_rep in this example. Give them unquoted and separated by a comma. 
+
+```{r cleaning}
+clean_data <- qpcr_clean(raw_data, cq = cq_values, threshold = 1, treatment, primer_pair, bio_rep)
+```
+
+The following table contains all removed outliers and missing values:
+
+```{r show outliers}
+outliers <- raw_data %>%
+  setdiff(clean_data)
+
+knitr::kable(
+  outliers)
+```
+
+If most outliers are from a specific biological replicate, than this is an indication that there is something wrong with that specific experiment. 
+If most outliers are the first or third technical replicate, it could indicate problems with seal attachment at the edge of your qPCR plate, depending on your plate design. 
+
+For context, you might want to see the other Cq values within a technical replicate that contains an outlier.  
+
+```{r show outlier context}
+extra_col <- outliers %>%
+  mutate(outlier = TRUE) %>%
+  select(-cq_values)
+
+triplets <- outliers %>%
+  select(-cq_values) %>% #put your column name here for the cq values column
+  select(-tech_rep) %>% #put the name of your technical replicate column here
+  left_join(raw_data, by = c("treatment", "bio_rep", "primer_pair")) %>% #put all other column names here, except for the cq and tech rep columns.
+  distinct() %>%
+  left_join(extra_col, by = c("treatment", "bio_rep", "primer_pair", "tech_rep")) #put the names of all columns except for the cq value column
+
+knitr::kable(
+  triplets)
+```
+
+## Averaging technical replicates
+
+Now it is time to take the average of the Cq values within all the remaining technical replicates. We will do this with the `qpcr_avg()` function. The column containing this average will be called `cq`.
+
+Function arguments:
+
+* The name of your (cleaned) dataset
+* `cq = ` the name of the column containing the Cq values
+* all other column names, excluding the columns containing the Cq values or technical replicates. Give them unquoted and separated by a comma. 
+
+Check the table to see if it worked:
+
+```{r avg tech_reps}
+avg_data <- qpcr_avg(clean_data, cq = cq_values, treatment, primer_pair, bio_rep)
+
+knitr::kable(avg_data[1:6,],
+             caption = "The first six rows of the average Cq values")
+```
+
+At this point I like to make some exploratory plots. Check if your housekeeping gene is indeed stable. Maybe you can already see if your experimental genes look promising. 
+
+```{r plot rawcq}
+ggplot(data = avg_data, aes(x = treatment, y = cq))+  #replace x to you situation
+  geom_point()+
+  facet_wrap(~primer_pair) #replace as needed
+```
+
+## Calculate dCq values
+
+The `qpcr_dcq()` function subtracts the housekeeping gene Cq values from the experimental genes Cq values. 
+
+Function arguments: 
+
+* The name of the dataset containing the average Cq values. It **must** contain a column named `cq`. If you use this markdown document such a dataset is already created using `qpcr_avg()`.
+* `primer_pair = ` supplies the name of the column that denotes which gene was the target of the PCR. 
+* `housekeeping = ` give the value of your housekeeping gene, in quotes, as it occurs in your primer_pair column. 
+* All other column names excluding columns for: cq values, technical replicates and primers used. 
+
+```{r dcq}
+dcq_values <- qpcr_dcq(avg_data, primer_pair = primer_pair, housekeeping = "gene_hk", treatment, bio_rep)
+
+knitr::kable(dcq_values[1:6,], caption = "The first six rows of the dCq values")
+```
+
+Again we can make some intermediate plots. 
+
+```{r plot dcq}
+dcq_values %>%
+  ggplot(aes(treatment, dcq))+ # replace treatment with whatever you used
+    geom_point()+
+    facet_grid(cols = vars(primer_pair)) #use if you pcr multiple genes
+```
+
+## Calculating ddCq values
+
+The function `qpcr_ddcq` subtracts the dCq control from the dCq treatments. It also calculates the fold change. 
+
+Function arguments: 
+
+* The dataset containing the dCq values. It **must** contain a column called `dcq`, as created by the `qpcr_dcq()` function.
+* `treatment = ` tells the function the name of the column containing the treatment information. This function cannot deal with multiple treatment variables yet, for example if you have different cell lines and timepoints! In this case I would calculate the dCq for each cell line separately. Use `HEK293_data <- filter(data, cell_line == "HEK293"` to create separate datasets. 
+* `untreated = ` give the value in the treatment column that corresponds with you untreated control samples. 
+* `primer_pair` give the column name of the column that indicates which genes were targeted for PCR. 
+
+
+```{r ddcq}
+ddcq_values <- qpcr_ddcq(dcq_values, treatment = treatment, untreated = "ctrl", primer_pair = primer_pair)
+
+knitr::kable(ddcq_values[1:6,], caption = "The first six rows of the ddCq values") 
+```
+
+## Plotting
+
+Very common for qPCR data is a barchart with errorbars and the actual data as points. Including the data points is [important](https://journals.plos.org/plosbiology/article?id=10.1371/journal.pbio.1002128)! For the bar and the errorbars we have to calculate some summary statistics first. We can then call upon the summary data inside the geoms. 
+
+```{r barplot}
+#calculate mean and standard deviation
+summary <- ddcq_values %>%
+  group_by(treatment, primer_pair) %>%  #fill in the column names of your experimental variables and primer targets
+  summarise(
+    sd = sd(fold_change, na.rm = TRUE),
+    mean_fc = mean(fold_change, na.rm = TRUE)
+  )
+
+#making the barchart
+ddcq_values %>%
+  ggplot(aes(treatment, fold_change))+  #replace treatment with your column name.
+    geom_bar(data = summary, aes(treatment, mean_fc), stat = "identity", alpha = 0.8)+ #replace treatment with your column name.
+    geom_errorbar(data = summary, aes(treatment, mean_fc, ymin = mean_fc-sd, ymax = mean_fc+sd), #replace treatment with your column name.
+                  width = 0.2)+
+    geom_jitter(width = 0.2)+
+    facet_grid(cols = vars(primer_pair))+ #replace primer_pair with your column name.
+    stat_compare_means(label = "p.signif", method = "t.test", label.x = 1.5, show.legend = FALSE)+
+    theme_pubr()+ # this theme is supposed to be publication ready
+    theme(strip.text = element_text(size = 12))+ 
+    labs(x = "Treatment",  #set the axis labels and title
+         y = "Fold change",
+         title = "A barchart of fictional qPCR data")
+```
