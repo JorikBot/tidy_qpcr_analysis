@@ -3,11 +3,14 @@ title: "qPCR analysis workflow"
 output: github_document
 ---
 
+
 ```{r setup, include = FALSE}
 knitr::opts_chunk$set(echo = TRUE,
                       message = FALSE,
                       warning = FALSE)
 ```
+
+Run the code chunk below to load the required packages. (code is not shown after knitting to html)
 
 ```{r library, message = FALSE, echo = FALSE}
 #install.packages("tidyverse") #Use this to install if they are not installed yet.
@@ -19,6 +22,7 @@ library(rlang)
 library(ggpubr) #this package extends ggplot2
 ```
 
+Run the code below to activate the functions. (code is not shown after knitting to html)
 
 ```{r functions, echo = FALSE}
 #to do: function for showing triplicates with outlier, function for summary statistics, use qpcr_ddcq with cq values as input, error messages.
@@ -51,44 +55,77 @@ qpcr_clean <- function(.data, cq, threshold, ...){
   clean_data
 }
 
-qpcr_avg <- function(.data, cq, ...){
+qpcr_outlier_context <- function(raw_data, clean_data, cq_values, tech_rep, ...){
+  #turn some values into strings for joining tables
+  dots <- names(enquos(..., .named = TRUE))
+  string_tech_rep <- names(enquos(tech_rep, .named = TRUE))
+  join2 <- append(dots, string_tech_rep)
+  
+  #first find all the outliers
+  outliers <- raw_data %>%
+    setdiff(clean_data)
+  
+  #give outliers extra columns, all TRUE
+  extra_col <- outliers %>%
+    mutate(outlier = TRUE) %>%
+    select(-{{cq_values}})
+  
+  #find all triplets with outliers
+  triplets <- outliers %>%
+    select(-{{cq_values}}) %>%
+    select(-{{tech_rep}}) %>%
+    left_join(raw_data, by = dots) %>%
+    distinct() %>%
+    left_join(extra_col, by = join2)
+  triplets
+}
+
+qpcr_avg_techrep <- function(.data, cq, ...){
   .data %>%
     group_by(...) %>%
     summarise(cq = mean({{cq}}, na.rm = TRUE)) %>%
     ungroup()
 }
 
-qpcr_dcq <- function(.data, primer_pair, housekeeping, ...){
+qpcr_dcq <- function(.data, cq, primer_pair, housekeeping, ...){
   # to do: add if statements to check input. no column called cq etc. 
   dots <- names(enquos(..., .named = TRUE))
   
   cq_hk <- .data %>%
     filter({{primer_pair}} == housekeeping) %>%
-    rename(cq_hk = cq) %>%
+    mutate(cq_hk = {{cq}}) %>%
     select(..., cq_hk)
   
   dcq_values <- .data %>%
     filter({{primer_pair}} != "gene_hk") %>%
     inner_join(cq_hk, by = dots) %>%
-    mutate(dcq = cq - cq_hk)
+    mutate(dcq = {{cq}} - cq_hk)
   dcq_values
 }
 
-qpcr_ddcq <- function(.data, treatment, untreated, primer_pair){
+qpcr_ddcq <- function(.data, dcq = dcq, treatment, untreated, primer_pair){
   #to do: check inputs. must be dcq values. 
   primer_join <- names(enquos(primer_pair, .named = TRUE))
   
   dcq_ctrl <- .data %>%
     filter({{treatment}} == untreated) %>%
     group_by({{primer_pair}}) %>%
-    summarise(dcq_ctrl = mean(dcq, na.rm = TRUE))
+    summarise(dcq_ctrl = mean({{dcq}}, na.rm = TRUE))
   
   ddcq <- .data %>%
     filter(treatment != untreated) %>%
     inner_join(dcq_ctrl, by = primer_join) %>%
-    mutate(ddcq = dcq - dcq_ctrl,
+    mutate(ddcq = {{dcq}} - dcq_ctrl,
            fold_change = 2^-ddcq)
   ddcq
+}
+
+qpcr_summary <- function(data, to_summarise, ...){
+  summary <- data %>%
+    group_by(...) %>%
+    summarise(sd = sd({{to_summarise}}, na.rm = TRUE),
+              mean = mean({{to_summarise}}, na.rm = TRUE))
+  summary
 }
 
 ```
@@ -137,7 +174,7 @@ raw_data <- read_csv(file = "rawcqvalues.csv") # see above for which function to
 
 It's always a good idea to have a quick look at the imported data. Check if the columns are separated correctly. Check if the decimal point is at the right place.
 
-```{r check import}
+```{r check import, echo=FALSE}
 knitr::kable(
   raw_data[1:5, ], 
   caption = "First 5 rows of the raw data"
@@ -146,13 +183,13 @@ knitr::kable(
 
 ## Cleaning the data
 
-The function `qpcr_clean()` removes outliers from technical qPCR replicates. These outliers can occur thru inaccurate pipetting, pipetting in the wrong well, seal detachment, etc. It does so based on the deviation from the median value, using the following rules: 
+The function `qpcr_clean()` removes outliers from technical qPCR replicates. These outliers can occur thru inaccurate pipetting, pipetting in the wrong well, seal detachment, etc. The function removes them based on the deviation from the median value, using the following rules: 
 
 * If only one Cq value is present (i.e. the other replicates failed to produce a Cq value), it will be removed. 
-* If only two Cq values are present, they need to be less than the threshold appart. 
+* If only two Cq values are present, they need to be less than a threshold apart. 
 * For three or more technical replicates:
   * If the absolute distance between a Cq value and the median Cq is greater than a set threshold, than this value will be removed. 
-  * If all Cq values within a technical replicate are more than the threshold appart, they will all be removed. 
+  * If all Cq values within a technical replicate are more than a threshold apart, they will all be removed. 
 
 Function arguments:
 
@@ -165,12 +202,14 @@ Function arguments:
 clean_data <- qpcr_clean(raw_data, cq = cq_values, threshold = 1, treatment, primer_pair, bio_rep)
 ```
 
-The following table contains all removed outliers and missing values:
-
 ```{r show outliers}
 outliers <- raw_data %>%
   setdiff(clean_data)
+```
 
+The following table contains all removed outliers and missing values:
+
+```{r,echo=FALSE}
 knitr::kable(
   outliers)
 ```
@@ -178,39 +217,49 @@ knitr::kable(
 If most outliers are from a specific biological replicate, than this is an indication that there is something wrong with that specific experiment. 
 If most outliers are the first or third technical replicate, it could indicate problems with seal attachment at the edge of your qPCR plate, depending on your plate design. 
 
-For context, you might want to see the other Cq values within a technical replicate that contains an outlier.  
+For context, you might want to see the other Cq values within a technical replicate that contains an outlier. That's what the `qpcr_outlier_context()` function is for. 
+
+Function arguments:
+
+* `raw_data = ` Here you supply the raw unfiltered data
+* `clean_data =` Here you supply the cleaned data from the `qpcr_clean()` function
+* `cq_values = ` Give name of the column containing the cq values
+* `tech_rep = ` Give the name of the column containing the technical replicate information
+* All other column names, excluding the columns containing the Cq values or technical replicates. Give them unquoted and separated by a comma. 
 
 ```{r show outlier context}
-extra_col <- outliers %>%
-  mutate(outlier = TRUE) %>%
-  select(-cq_values)
 
-triplets <- outliers %>%
-  select(-cq_values) %>% #put your column name here for the cq values column
-  select(-tech_rep) %>% #put the name of your technical replicate column here
-  left_join(raw_data, by = c("treatment", "bio_rep", "primer_pair")) %>% #put all other column names here, except for the cq and tech rep columns.
-  distinct() %>%
-  left_join(extra_col, by = c("treatment", "bio_rep", "primer_pair", "tech_rep")) #put the names of all columns except for the cq value column
-
-knitr::kable(
-  triplets)
+outlier_triplets <- qpcr_outlier_context(raw_data = raw_data, 
+                                         clean_data = clean_data, 
+                                         cq_values = cq_values, 
+                                         tech_rep = tech_rep, 
+                                         treatment, bio_rep, primer_pair)
 ```
+
+```{r}
+opts <- options(knitr.kable.NA = "")
+knitr::kable(
+  outlier_triplets)
+```
+
 
 ## Averaging technical replicates
 
-Now it is time to take the average of the Cq values within all the remaining technical replicates. We will do this with the `qpcr_avg()` function. The column containing this average will be called `cq`.
+Now it is time to take the average of the Cq values within all the remaining technical replicates. We will do this with the `qpcr_avg_techrep()` function. The column containing this average will be called `cq`.
 
 Function arguments:
 
 * The name of your (cleaned) dataset
 * `cq = ` the name of the column containing the Cq values
-* all other column names, excluding the columns containing the Cq values or technical replicates. Give them unquoted and separated by a comma. 
+* All other column names, excluding the columns containing the Cq values or technical replicates. Give them unquoted and separated by a comma. 
 
 Check the table to see if it worked:
 
 ```{r avg tech_reps}
-avg_data <- qpcr_avg(clean_data, cq = cq_values, treatment, primer_pair, bio_rep)
+avg_data <- qpcr_avg_techrep(clean_data, cq = cq_values, treatment, primer_pair, bio_rep)
+```
 
+```{r, echo=FALSE}
 knitr::kable(avg_data[1:6,],
              caption = "The first six rows of the average Cq values")
 ```
@@ -229,14 +278,16 @@ The `qpcr_dcq()` function subtracts the housekeeping gene Cq values from the exp
 
 Function arguments: 
 
-* The name of the dataset containing the average Cq values. It **must** contain a column named `cq`. If you use this markdown document such a dataset is already created using `qpcr_avg()`.
+* The name of the dataset containing the average Cq values. 
+* `cq = ` give the name of the column containing the (averaged) Cq values. If you used the `qpcr_avg_techrep()` function this column is called `cq`. 
 * `primer_pair = ` supplies the name of the column that denotes which gene was the target of the PCR. 
 * `housekeeping = ` give the value of your housekeeping gene, in quotes, as it occurs in your primer_pair column. 
 * All other column names excluding columns for: cq values, technical replicates and primers used. 
 
 ```{r dcq}
-dcq_values <- qpcr_dcq(avg_data, primer_pair = primer_pair, housekeeping = "gene_hk", treatment, bio_rep)
-
+dcq_values <- qpcr_dcq(avg_data, cq = cq, primer_pair = primer_pair, housekeeping = "gene_hk", treatment, bio_rep)
+```
+```{r, echo=FALSE}
 knitr::kable(dcq_values[1:6,], caption = "The first six rows of the dCq values")
 ```
 
@@ -255,36 +306,53 @@ The function `qpcr_ddcq` subtracts the dCq control from the dCq treatments. It a
 
 Function arguments: 
 
-* The dataset containing the dCq values. It **must** contain a column called `dcq`, as created by the `qpcr_dcq()` function.
-* `treatment = ` tells the function the name of the column containing the treatment information. This function cannot deal with multiple treatment variables yet, for example if you have different cell lines and timepoints! In this case I would calculate the dCq for each cell line separately. Use `HEK293_data <- filter(data, cell_line == "HEK293"` to create separate datasets. 
+* The dataset containing the dCq values.
+* `dcq = ` give the name of the column containing the dCq values. If you used the `qpcr_dcq()` function to create the dataset you don't need to use this argument. 
+* `treatment = ` tells the function the name of the column containing the treatment information. This function cannot deal with multiple treatment variables yet, for example if you have different additives and timepoints! In this case I would calculate the ddCq for each additive separately. Use `A_data <- filter(data, additive == "A")` to create separate datasets. 
 * `untreated = ` give the value in the treatment column that corresponds with you untreated control samples. 
 * `primer_pair` give the column name of the column that indicates which genes were targeted for PCR. 
 
 
 ```{r ddcq}
 ddcq_values <- qpcr_ddcq(dcq_values, treatment = treatment, untreated = "ctrl", primer_pair = primer_pair)
-
+```
+```{r, echo=FALSE}
 knitr::kable(ddcq_values[1:6,], caption = "The first six rows of the ddCq values") 
 ```
 
+## All in one
+
+It is also possible to chain all the functions together using the [pipe](https://r4ds.had.co.nz/pipes.html). This is the fastest way to do it, but you will miss all the intermediate data. 
+
+```{r}
+ddcq_values <- raw_data %>%
+  qpcr_clean(cq = cq_values, threshold = 1, treatment, primer_pair, bio_rep) %>%
+  qpcr_avg_techrep(cq = cq_values, treatment, primer_pair, bio_rep) %>%
+  qpcr_dcq(cq = cq, primer_pair = primer_pair, housekeeping = "gene_hk", treatment, bio_rep) %>%
+  qpcr_ddcq(treatment = treatment, untreated = "ctrl", primer_pair = primer_pair) 
+ddcq_values
+```
+
+
 ## Plotting
 
-Very common for qPCR data is a barchart with errorbars and the actual data as points. Including the data points is [important](https://journals.plos.org/plosbiology/article?id=10.1371/journal.pbio.1002128)! For the bar and the errorbars we have to calculate some summary statistics first. We can then call upon the summary data inside the geoms. 
+Very common for qPCR data is a barchart with errorbars and the actual data as points. Including the data points is [important](https://journals.plos.org/plosbiology/article?id=10.1371/journal.pbio.1002128)! For the bar and the errorbars we have to calculate some summary statistics first. We can then call upon the summary data inside the geoms. The `qpcr_summary()` function calculates the mean and standard deviation.
+
+Function arguments:
+
+* The dataset you want to summarise, in this case the ddCq values.
+* `to_summarise = ` The column you want to apply the function to, for example the fold change values.
+* The variables you want to group your data by. In this example we want a mean and sd for every unique treatment and primer_pair combination. 
 
 ```{r barplot}
 #calculate mean and standard deviation
-summary <- ddcq_values %>%
-  group_by(treatment, primer_pair) %>%  #fill in the column names of your experimental variables and primer targets
-  summarise(
-    sd = sd(fold_change, na.rm = TRUE),
-    mean_fc = mean(fold_change, na.rm = TRUE)
-  )
+summary <- qpcr_summary(ddcq_values, to_summarise = fold_change, treatment, primer_pair)
 
 #making the barchart
 ddcq_values %>%
   ggplot(aes(treatment, fold_change))+  #replace treatment with your column name.
-    geom_bar(data = summary, aes(treatment, mean_fc), stat = "identity", alpha = 0.8)+ #replace treatment with your column name.
-    geom_errorbar(data = summary, aes(treatment, mean_fc, ymin = mean_fc-sd, ymax = mean_fc+sd), #replace treatment with your column name.
+    geom_bar(data = summary, aes(treatment, mean), stat = "identity", alpha = 0.8)+ #replace treatment with your column name.
+    geom_errorbar(data = summary, aes(treatment, mean, ymin = mean-sd, ymax = mean+sd), #replace treatment with your column name.
                   width = 0.2)+
     geom_jitter(width = 0.2)+
     facet_grid(cols = vars(primer_pair))+ #replace primer_pair with your column name.
