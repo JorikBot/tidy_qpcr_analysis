@@ -33,7 +33,8 @@ qpcr_clean <- function(.data, cq, threshold, ...){
   median_cq <- .data %>%
     group_by(...) %>%
     summarise(median_cq = median({{cq}}, na.rm = TRUE), #calculate the median cq value
-            count = sum(!is.na({{cq}}))) #count the amount of techreps with a cq value
+            count = sum(!is.na({{cq}}))) %>% #count the amount of techreps with a cq value
+    ungroup()
   
   dev_test <- .data %>%
     full_join(median_cq, by = dots) %>%
@@ -45,7 +46,8 @@ qpcr_clean <- function(.data, cq, threshold, ...){
   
   count_true <- dev_test %>%
     group_by(...) %>%
-    summarise(count_keep = sum(keep, na.rm = TRUE))
+    summarise(count_keep = sum(keep, na.rm = TRUE)) %>%
+    ungroup()
   
   clean_data <- dev_test %>%
     full_join(count_true, by = dots) %>%
@@ -97,7 +99,7 @@ qpcr_dcq <- function(.data, cq, primer_pair, housekeeping, ...){
     select(..., cq_hk)
   
   dcq_values <- .data %>%
-    filter({{primer_pair}} != "gene_hk") %>%
+    filter({{primer_pair}} != housekeeping) %>%
     inner_join(cq_hk, by = dots) %>%
     mutate(dcq = {{cq}} - cq_hk)
   dcq_values
@@ -169,7 +171,7 @@ Note: these function are from the readr package, which is part of the tidyverse.
 In this example we will use some randomly generated data. It contain Cq values for three genes: gene_a, gene_b and gene_hk (hk = housekeeping). There are also three treatment conditions: a, b and ctrl. ctrl is the untreated control. Three biological replicates were performed. 
 
 ```{r loading data}
-raw_data <- read_csv(file = "rawcqvalues.csv") # see above for which function to use if you use your own file. 
+raw_data <- read_delim(file = "rawcqvalues.csv", delim = ";") # see above for which function to use if you use your own file. 
 ```
 
 It's always a good idea to have a quick look at the imported data. Check if the columns are separated correctly. Check if the decimal point is at the right place.

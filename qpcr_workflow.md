@@ -71,7 +71,7 @@ ctrl is the untreated control. Three biological replicates were
 performed.
 
 ``` r
-raw_data <- read_csv(file = "rawcqvalues.csv") # see above for which function to use if you use your own file. 
+raw_data <- read_delim(file = "rawcqvalues.csv", delim = ";") # see above for which function to use if you use your own file. 
 ```
 
 It’s always a good idea to have a quick look at the imported data. Check
